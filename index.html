@@ -165,7 +165,8 @@
 const POOL = {
   participants  : ['Tommy','Grant','Gavin','Caleb','Will','Ethan'],
   golfersPerTeam: 5,
-  payouts       : [0.80, 0.20],
+  payouts       : [0.80, 0.20],  // 1st=80%, 2nd=20% — always fixed
+  totalPot      : 0,             // Populated from B3 of Auction Draft tab
 };
 
 const FIELD = [
@@ -198,12 +199,12 @@ let S = {
   sourceLabel:'', roundLabel:'',
 };
 
-/* ─── LOCAL STORAGE ─── */
 function loadPrefs() {
   try {
     const p = JSON.parse(localStorage.getItem('masters26_prefs') || '{}');
-    if (p.myTeam)  S.myTeam  = p.myTeam;
-    if (p.starred) S.starred = new Set(p.starred);
+    if (p.myTeam)   S.myTeam  = p.myTeam;
+    if (p.starred)  S.starred = new Set(p.starred);
+    if (p.totalPot) POOL.totalPot = p.totalPot;
     if (p.teams) Object.entries(p.teams).forEach(([k,v]) => {
       if (!S.teams[k]) S.teams[k] = {};
       if (v.golfers?.length) S.teams[k].golfers = v.golfers;
@@ -212,36 +213,66 @@ function loadPrefs() {
   } catch(e) {}
 }
 function savePrefs() {
-  try { localStorage.setItem('masters26_prefs', JSON.stringify({myTeam:S.myTeam,starred:[...S.starred],teams:S.teams})); } catch(e) {}
+  try { localStorage.setItem('masters26_prefs', JSON.stringify({myTeam:S.myTeam,starred:[...S.starred],teams:S.teams,totalPot:POOL.totalPot})); } catch(e) {}
 }
 
-/* ─── EXCEL LOADER ─── */
+/* ─── EXCEL LOADER ─────────────────────────────────────────────────────────
+   Reads Tab 3 "Auction Draft" (sheet index 2, 0-based):
+     B3  = Total pot dollar amount
+     B5:B10 = Participant names  (Excel rows 5-10, pandas index 4-9)
+     Golfers start at col C (index 2) and repeat every 2 cols: C,E,G,I,K
+     Bids are the odd cols between: D,F,H,J,L  (not used for pot — B3 is authoritative)
+
+   Payouts (80/20) are hardcoded per spec — not read from sheet.
+──────────────────────────────────────────────────────────────────────────── */
 async function loadPoolFromExcel() {
   try {
     const resp = await fetch('./pool.xlsx', { cache:'no-cache' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const buf = await resp.arrayBuffer();
     const wb  = XLSX.read(buf, { type:'array' });
-    const settingsWs = wb.Sheets['Pool Settings'];
-    if (settingsWs) {
-      const rows = XLSX.utils.sheet_to_json(settingsWs, { header:1 });
-      const pays = [parseFloat(rows[6]?.[2]), parseFloat(rows[7]?.[2]), parseFloat(rows[8]?.[2])].filter(x=>x>0);
-      if (pays.length) POOL.payouts = pays;
-      const names = rows.slice(14,20).map(r=>r[1]).filter(Boolean);
-      if (names.length) POOL.participants = names;
-    }
+
+    // ── Tab 3: Auction Draft ──────────────────────────────────────────────
     const draftWs = wb.Sheets['Auction Draft'];
     if (draftWs) {
       const rows = XLSX.utils.sheet_to_json(draftWs, { header:1 });
-      rows.slice(4).forEach(row => {
-        const name = row[1]; if (!name || typeof name !== 'string') return;
-        const golfers = [row[2],row[4],row[6],row[8],row[10]].map(g=>typeof g==='string'?g.trim():'').filter(Boolean);
-        const totalBid = [row[3],row[5],row[7],row[9],row[11]].reduce((a,b)=>a+(parseFloat(b)||0),0);
+
+      // B3 = row index 2 (0-based), col index 1 (B)
+      const potRaw = rows[2]?.[1];
+      const pot = parseFloat(potRaw) || 0;
+      if (pot > 0) {
+        // Store pot directly on POOL so payout strip is correct
+        POOL.totalPot = pot;
+      }
+
+      // Participant rows: Excel B5–B10 → pandas index 4–9
+      // Col layout (0-based): 0=#, 1=Name, 2=G1, 3=B1, 4=G2, 5=B2, 6=G3, 7=B3, 8=G4, 9=B4, 10=G5, 11=B5
+      const participantRows = rows.slice(4, 10); // indices 4,5,6,7,8,9
+      const names = [];
+      participantRows.forEach(row => {
+        const name = row[1];
+        if (!name || typeof name !== 'string' || !name.trim()) return;
+        names.push(name.trim());
+        // Golfers: cols 2,4,6,8,10 (every 2 starting at C)
+        const golfers = [row[2], row[4], row[6], row[8], row[10]]
+          .map(g => (typeof g === 'string' ? g.trim() : ''))
+          .filter(Boolean);
         if (!S.teams[name]) S.teams[name] = {};
         if (golfers.length) S.teams[name].golfers = golfers;
-        if (totalBid > 0)   S.teams[name].bid     = totalBid;
+        // Each participant's share of pot = pot / numParticipants (set after names are collected)
       });
+      if (names.length) POOL.participants = names;
+
+      // Distribute pot evenly across participants
+      if (pot > 0 && names.length) {
+        const share = pot / names.length;
+        names.forEach(n => {
+          if (!S.teams[n]) S.teams[n] = {};
+          S.teams[n].bid = share;
+        });
+      }
     }
+
     S.excelLoaded = true; S.excelError = null;
   } catch(err) { S.excelError = err.message; S.excelLoaded = false; }
 }
@@ -453,8 +484,56 @@ function useDemoData() {
 }
 
 /* ─── HELPERS ─── */
-function getPot() { return Object.values(S.teams).reduce((s,t)=>s+(t.bid||0),0); }
-function getPrizes() { const pot=getPot(); return POOL.payouts.map((pct,i)=>({place:i+1,pct,amount:pot*pct})); }
+
+// Total pot = POOL.totalPot (read from B3 of Auction Draft tab)
+function getPot() {
+  return POOL.totalPot || 0;
+}
+
+// Always 80% 1st / 20% 2nd — hardcoded per spec
+function getPrizes() {
+  const pot = getPot();
+  return [
+    { place:1, label:'🥇 1st Place (80%)', amount: Math.round(pot * 0.80) },
+    { place:2, label:'🥈 2nd Place (20%)', amount: Math.round(pot * 0.20) },
+  ];
+}
+
+// Determine current round from live data (0 = not started)
+function getCurrentRound() {
+  if (!S.leaderboard.length || !S.isLive) return 0;
+  let max = 0;
+  S.leaderboard.forEach(g => {
+    if (g.r4 != null && g.r4 !== '-') max = Math.max(max, 4);
+    else if (g.r3 != null && g.r3 !== '-') max = Math.max(max, 3);
+    else if (g.r2 != null && g.r2 !== '-') max = Math.max(max, 2);
+    else if (g.r1 != null && g.r1 !== '-') max = Math.max(max, 1);
+  });
+  return max;
+}
+
+// Potential POOL earnings for one golfer.
+// Returns { amount:Number, display:String }
+// — 'N/A'  before cuts (rounds 1–2)
+// — '$0'   after cut (player was eliminated)
+// — '$X'   if currently 1st or 2nd after cuts
+// — ''     (blank) all other positions after cuts
+function calcEarnings(g) {
+  if (!g) return { amount:0, display:'' };
+  const round = getCurrentRound();
+
+  // Before cut weekend (rounds 1–2), show N/A for everyone
+  if (round < 3) return { amount:0, display:'N/A' };
+
+  // Cut players always show $0
+  if (g.isCut) return { amount:0, display:'$0' };
+
+  const prizes = getPrizes();
+  if (g.place === 1) return { amount:prizes[0].amount, display:fmtMoney(prizes[0].amount) };
+  if (g.place === 2) return { amount:prizes[1].amount, display:fmtMoney(prizes[1].amount) };
+  return { amount:0, display:'' };
+}
+
 function matchGolfer(name) {
   if (!name) return null;
   const tn=name.toLowerCase().trim();
@@ -472,14 +551,6 @@ function nameLookup(a,b) {
   const aL=an.split(' ').pop(), bL=bn.split(' ').pop();
   return aL===bL && aL.length>3;
 }
-function calcEarnings(g) {
-  if(!g||g.isCut) return 0;
-  const prizes=getPrizes();
-  if(g.place===1) return prizes[0]?.amount||0;
-  if(g.place===2) return prizes[1]?.amount||0;
-  if(g.place===3) return prizes[2]?.amount||0;
-  return 0;
-}
 function fmtScore(t,isCut) { if(isCut)return'CUT'; const n=parseInt(t); if(isNaN(n)||n===0)return'E'; return n<0?String(n):'+'+n; }
 function scoreClass(t,isCut) { if(isCut)return'sc-cut'; const n=parseInt(t); if(isNaN(n)||n===0)return'sc-even'; return n<0?'sc-under':'sc-over'; }
 function placeClass(p,isCut) { if(isCut)return'pCT'; if(p===1)return'p1'; if(p===2)return'p2'; if(p===3)return'p3'; return'pN'; }
@@ -487,10 +558,13 @@ function fmtMoney(n) { return '$'+Math.round(n).toLocaleString(); }
 
 function renderPotStrip() {
   const pot=getPot();
-  document.getElementById('pot-total').textContent='$'+pot.toLocaleString();
-  const labels=['🥇 1st','🥈 2nd','🥉 3rd'];
-  document.getElementById('payouts-row').innerHTML=getPrizes().map((p,i)=>
-    `<div class="payout-badge"><div class="payout-place">${labels[i]}</div><div class="payout-amt">$${Math.round(p.amount).toLocaleString()}</div></div>`
+  document.getElementById('pot-total').textContent = pot > 0 ? '$'+pot.toLocaleString() : '—';
+  const prizes = getPrizes();
+  document.getElementById('payouts-row').innerHTML = prizes.map(p =>
+    `<div class="payout-badge">
+      <div class="payout-place">${p.label}</div>
+      <div class="payout-amt">${pot > 0 ? '$'+p.amount.toLocaleString() : '—'}</div>
+    </div>`
   ).join('');
   if (S.roundLabel) document.getElementById('tourn-status').textContent=`Augusta · ${S.roundLabel}`;
 }
@@ -531,14 +605,19 @@ function renderLeaderboard() {
 }
 
 function golferRowHtml(g, isStarred) {
-  const earn=calcEarnings(g);
-  const earnHtml=earn>0?`<div class="golfer-earn">${fmtMoney(earn)}</div>`:'';
+  const earn = calcEarnings(g);
+  // Show earnings if there's a display value (N/A, $0, $X)
+  const earnHtml = earn.display
+    ? `<div class="golfer-earn" style="${earn.display==='N/A'?'color:#6a9478':earn.display==='$0'?'color:#e06060':''}">${earn.display}</div>`
+    : '';
   const rounds=[g.r1,g.r2,g.r3,g.r4].filter(r=>r!=null&&r!==''&&r!=='-');
   const roundStr=rounds.length?rounds.join(' · '):'–';
   const thruHtml=(g.thru&&!g.isCut)?`<span class="thru-pill">${g.thru}</span>`:'';
   const safeNm=g.name.replace(/'/g,"\\'");
+  // Place badge: show CUT for cut players
+  const placeBadgeTxt = g.isCut ? 'CUT' : (g.placeTxt||g.place);
   return `<div class="golfer-row ${isStarred?'starred':''}">
-    <div class="place-badge ${placeClass(g.place,g.isCut)}">${g.placeTxt||g.place}</div>
+    <div class="place-badge ${placeClass(g.place,g.isCut)}">${placeBadgeTxt}</div>
     <div class="golfer-info">
       <div class="golfer-name">${g.name}${thruHtml}</div>
       <div class="golfer-meta">${roundStr}</div>
@@ -554,8 +633,14 @@ function toggleStar(name){S.starred.has(name)?S.starred.delete(name):S.starred.a
 
 /* ─── TEAMS TAB ─── */
 function calcTeamEarnings(pName) {
-  const t=S.teams[pName]; if(!t?.golfers) return 0;
-  return t.golfers.filter(Boolean).reduce((sum,g)=>{const gd=matchGolfer(g);return sum+(gd?calcEarnings(gd):0);},0);
+  const t=S.teams[pName]; if(!t?.golfers) return { amount:0, display:'—' };
+  const round = getCurrentRound();
+  const total = t.golfers.filter(Boolean).reduce((sum,g)=>{
+    const gd=matchGolfer(g);
+    return sum + (gd ? calcEarnings(gd).amount : 0);
+  }, 0);
+  if (round < 3) return { amount:0, display:'N/A' };
+  return { amount:total, display: total > 0 ? fmtMoney(total) : '$0' };
 }
 function renderTeams() {
   let html='';
@@ -565,16 +650,17 @@ function renderTeams() {
   const hasRosters=Object.values(S.teams).some(t=>t.golfers?.some(Boolean));
   if (!hasRosters) html+=`<div class="info-banner"><strong>Set up your pool!</strong><br>Add the total pot and each team's golfers. Or fill in pool.xlsx and upload it to GitHub.</div>`;
 
-  const teamList=POOL.participants.map(name=>({name,team:S.teams[name]||{golfers:[]},earnings:calcTeamEarnings(name)})).sort((a,b)=>b.earnings-a.earnings||a.name.localeCompare(b.name));
+  const teamList=POOL.participants.map(name=>({name,team:S.teams[name]||{golfers:[]},earnings:calcTeamEarnings(name)})).sort((a,b)=>(b.earnings.amount||0)-(a.earnings.amount||0)||a.name.localeCompare(b.name));
   teamList.forEach((t,i)=>{
     const rank=i+1,isMyTeam=S.myTeam===t.name,isExpanded=S.expanded.has(t.name);
     const golfers=(t.team.golfers||[]).filter(Boolean),safeNm=t.name.replace(/'/g,"\\'");
+    const earnDisplay = golfers.length ? (t.earnings.display || '—') : '—';
     html+=`<div class="team-card ${isMyTeam?'my-team':''}">
       <div class="team-header" onclick="toggleExpand('${safeNm}')">
         <div class="team-rank ${placeClass(rank,false)}">${rank}</div>
         <div class="team-name-label">${t.name}${isMyTeam?'<span class="me-chip">Me</span>':''}</div>
         <div class="team-earn-col">
-          <div class="team-earn-num">${golfers.length?(t.earnings>0?fmtMoney(t.earnings):'$0'):'—'}</div>
+          <div class="team-earn-num" style="${earnDisplay==='N/A'?'color:#6a9478':''}">${earnDisplay}</div>
           <div class="team-earn-sub">${golfers.length} golfer${golfers.length!==1?'s':''}</div>
         </div>
         <button class="my-star-btn ${isMyTeam?'on':''}" onclick="event.stopPropagation();setMyTeam('${safeNm}')">★</button>
@@ -586,12 +672,13 @@ function renderTeams() {
         html+=`<div style="padding:12px 14px;font-size:13px;color:#6a9478;font-family:sans-serif;">No roster yet · <span style="color:#c9a84c;cursor:pointer;" onclick="openTeamEdit('${safeNm}')">Add golfers</span></div>`;
       } else {
         golfers.forEach(gname=>{
-          const gd=matchGolfer(gname),earn=gd?calcEarnings(gd):0;
+          const gd=matchGolfer(gname), earn=calcEarnings(gd);
+          const earnColor = earn.display==='N/A' ? '#6a9478' : earn.display==='$0' ? '#e06060' : '#c9a84c';
           html+=`<div class="tg-row">
-            <div class="mini-badge ${gd?placeClass(gd.place,gd.isCut):'pN'}">${gd?gd.placeTxt:'?'}</div>
+            <div class="mini-badge ${gd?placeClass(gd.place,gd.isCut):'pN'}">${gd?(gd.isCut?'CUT':gd.placeTxt):'?'}</div>
             <div class="tg-name">${gname}</div>
             <div class="tg-score ${gd?scoreClass(gd.total,gd.isCut):'sc-even'}">${gd?fmtScore(gd.total,gd.isCut):'—'}</div>
-            <div class="tg-earn">${earn>0?fmtMoney(earn):''}</div>
+            <div class="tg-earn" style="color:${earnColor}">${earn.display||''}</div>
           </div>`;
         });
       }
@@ -624,7 +711,12 @@ function openSettingsModal(){
 }
 function savePot(){
   const pot=parseFloat(document.getElementById('inp-pot')?.value)||0;
-  if(pot>0){const share=pot/POOL.participants.length;POOL.participants.forEach(p=>{if(!S.teams[p])S.teams[p]={golfers:[]};S.teams[p].bid=share;});}
+  if(pot>0) {
+    POOL.totalPot = pot;
+    // Also distribute evenly to team bids for reference
+    const share=pot/POOL.participants.length;
+    POOL.participants.forEach(p=>{if(!S.teams[p])S.teams[p]={golfers:[]};S.teams[p].bid=share;});
+  }
   savePrefs();closeModal();render();
 }
 function openTeamEdit(participant){
